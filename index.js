@@ -6,7 +6,7 @@ const {
   useMultiFileAuthState, 
   fetchLatestBaileysVersion, 
   DisconnectReason 
-} = require("@whiskeysockets/baileys");
+} = require("npm:baileys@6.7.21");
 
 const { handleCommand } = require("./menu/case");
 const { loadSettings } = require("./settings");
