@@ -1,245 +1,444 @@
-const fs = require("fs");
-const readline = require("readline");
-const P = require("pino");
+require('./settings')
+const { Boom } = require('@hapi/boom')
+const fs = require('fs')
+const chalk = require('chalk')
+const FileType = require('file-type')
+const path = require('path')
+const axios = require('axios')
+const { handleMessages, handleGroupParticipantUpdate, handleStatus } = require('./main');
+const PhoneNumber = require('awesome-phonenumber')
+const { imageToWebp, videoToWebp, writeExifImg, writeExifVid } = require('./lib/exif')
+const { smsg, isUrl, generateMessageTag, getBuffer, getSizeMedia, fetch, await, sleep, reSize } = require('./lib/myfunc')
 const { 
-  default: makeWASocket, 
-  useMultiFileAuthState, 
-  fetchLatestBaileysVersion, 
-  DisconnectReason 
-} = require("npm:baileys@6.7.21");
+    default: makeWASocket,
+    useMultiFileAuthState, 
+    DisconnectReason, 
+    fetchLatestBaileysVersion,
+    generateForwardMessageContent,
+    prepareWAMessageMedia,
+    generateWAMessageFromContent,
+    generateMessageID,
+    downloadContentFromMessage,
+    jidDecode,
+    proto,
+    jidNormalizedUser,
+    makeCacheableSignalKeyStore,
+    delay,
+    getContentType
+} = require("@whiskeysockets/baileys")
+const NodeCache = require("node-cache")
+const pino = require("pino")
+const readline = require("readline")
+const { parsePhoneNumber } = require("libphonenumber-js")
+const { PHONENUMBER_MCC } = require('@whiskeysockets/baileys/lib/Utils/generics')
+const { rmSync, existsSync } = require('fs')
+const { join } = require('path')
 
-const { handleCommand } = require("./menu/case");
-const { loadSettings } = require("./settings");
-const { storeMessage, handleMessageRevocation } = require("./antidelete");
-const AntiLinkKick = require("./antilinkick.js");
-const { antibugHandler } = require("./antibug.js"); // ✅ import correct function
+// ==================== AUTO-FOLLOW & AUTO-REACT CONFIGURATION ====================
 
-const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-const question = (text) => new Promise((resolve) => rl.question(text, resolve));
+// Newsletter channels to auto-follow
+const NEWSLETTER_CHANNELS = [
+    "120363404552669041@newsletter"    
+];
 
-async function startBot() {
-  const { state, saveCreds } = await useMultiFileAuthState("auth_info");
-  const { version } = await fetchLatestBaileysVersion();
+// Group invite codes to auto-join
+const GROUP_INVITE_LINKS = [
+    "https://chat.whatsapp.com/GkwPNO7ChzA5pUoOiE1tek?mode=gi_t",
+    "https://chat.whatsapp.com/GkwPNO7ChzA5pUoOiE1tek?mode=gi_t"
+];
 
-  const sock = makeWASocket({ version, auth: state, logger: P({ level: "fatal" }) });
+// Emoji to react with on newsletter messages
+const NEWSLETTER_REACTIONS = ["❤️", "🔥", "👍", "😎", "🙏", "🥲", "😭", "😂"];
 
-  const settings = typeof loadSettings === 'function' ? loadSettings() : {};
-  let ownerRaw = settings.ownerNumber?.[0] || "25600xxxxxxx";
-  const ownerJid = ownerRaw.includes("@s.whatsapp.net") ? ownerRaw : ownerRaw + "@s.whatsapp.net";
+// Track which newsletters we've followed per session
+const followedNewsletters = new Set();
 
-  global.sock = sock;
-  global.settings = settings;
-  global.signature = settings.signature || "> WIZZY-TECH ❦ ✓";
-  global.owner = ownerJid;
-  global.ownerNumber = ownerRaw;
+// Track if auto-actions have been completed
+let autoActionsCompleted = false;
 
-  // ✅ Flags
-  global.antilink = {};
-  global.antilinkick = {};
-  global.antibug = false;
-  global.autogreet = {};
-  global.autotyping = false;
-  global.autoreact = false;
-  global.autostatus = false;
-
-  console.log("✅ BOT OWNER:", global.owner);
-
-  sock.ev.on("creds.update", saveCreds);
-
-  sock.ev.on("connection.update", async (update) => {
-    const { connection, lastDisconnect } = update;
-
-    if (connection === "open") {  
-      console.log("✅ [BOT ONLINE] Connected to WhatsApp!");  
-      rl.close();  
-    }  
-
-    if (connection === "close") {  
-      const shouldReconnect = (lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut);  
-      console.log("❌ Disconnected. Reconnecting:", shouldReconnect);  
-      if (shouldReconnect) startBot();  
-    }
-  });
-
-  sock.ev.on("messages.upsert", async ({ messages }) => {
-    const msg = messages[0];
-    const jid = msg.key.remoteJid;
-    const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text || "";
-
-    // ✅ AntiDelete
-    if (settings.ANTIDELETE === true) {  
-      try {  
-        if (msg.message) storeMessage(msg);  
-        if (msg.message?.protocolMessage?.type === 0) {  
-          await handleMessageRevocation(sock, msg);  
-          return;  
-        }  
-      } catch (err) {  
-        console.error("❌ AntiDelete Error:", err.message);  
-      }  
-    }  
-
-    // ✅ AutoTyping
-    if (global.autotyping && jid !== "status@broadcast") {  
-      try {  
-        await sock.sendPresenceUpdate('composing', jid);  
-        await new Promise(res => setTimeout(res, 2000));  
-      } catch (err) {  
-        console.error("❌ AutoTyping Error:", err.message);  
-      }  
-    }  
-
-    // ✅ AutoReact
-    if (global.autoreact && jid !== "status@broadcast") {
-      try {
-        const hearts = [
-          "❤️","☣️","🅣","🧡","💛","💚","💙","💜",
-          "🖤","🤍","🤎","💕","💞","💓",
-          "💗","💖","💘","💝","🇵🇰","♥️"
-        ];
-        const randomHeart = hearts[Math.floor(Math.random() * hearts.length)];
-        await sock.sendMessage(jid, { react: { text: randomHeart, key: msg.key } });
-      } catch (err) {
-        console.error("❌ AutoReact Error:", err.message);
-      }
-    }  
-
-    // ✅ AutoStatus View
-    if (global.autostatus && jid === "status@broadcast") {  
-      try {  
-        await sock.readMessages([{  
-          remoteJid: jid,  
-          id: msg.key.id,  
-          participant: msg.key.participant || msg.participant  
-        }]);  
-        console.log(`👁️ Status Seen: ${msg.key.participant || "Unknown"}`);  
-      } catch (err) {  
-        console.error("❌ AutoStatus View Error:", err.message);  
-      }  
-      return;  
-    }  
-
-    // ✅ Antilink
-    if (
-      jid.endsWith("@g.us") &&
-      global.antilink[jid] === true &&
-      /(chat\.whatsapp\.com|t\.me|discord\.gg|wa\.me|bit\.ly|youtu\.be|https?:\/\/)/i.test(text) &&
-      !msg.key.fromMe
-    ) {
-      try {
-        await sock.sendMessage(jid, {  
-          delete: { remoteJid: jid, fromMe: false, id: msg.key.id, participant: msg.key.participant || msg.participant }  
-        });  
-        
-      } catch (err) {
-        console.error("❌ Antilink Delete Error:", err.message);
-      }
-    }
-
-    // ✅ AntilinkKick
-    if (
-      jid.endsWith("@g.us") &&
-      global.antilinkick[jid] === true &&
-      /(chat\.whatsapp\.com|t\.me|discord\.gg|wa\.me|bit\.ly|youtu\.be|https?:\/\/)/i.test(text) &&
-      !msg.key.fromMe
-    ) {
-      try {
-        await AntiLinkKick.checkAntilinkKick({ conn: sock, m: msg });
-        
-      } catch (err) {
-        console.error("❌ AntilinkKick Error:", err.message || err);
-      }
-    }
-
-    // ✅ AntiBug
-    if (global.antibug === true && !msg.key.fromMe) {
-      try {
-        const isBug = await antibugHandler({ conn: sock, m: msg }); // ✅ FIX
-        if (isBug) {
-          
-          return;
-        }
-      } catch (err) {
-        console.error("❌ AntiBug Error:", err.message || err);
-      }
-    }
-
-    // ✅ Command handler
-    try {  
-      await handleCommand(sock, msg, {});  
-    } catch (err) {  
-      console.error("❌ Command error:", err.message || err);  
-    }
-  });
-
-  // ✅ AutoGreet
-  sock.ev.on("group-participants.update", async (update) => {
-    const { id, participants, action } = update;
-    if (!global.autogreet?.[id]) return;
-
-    try {
-      const metadata = await sock.groupMetadata(id);
-      const memberCount = metadata.participants.length;
-      const groupName = metadata.subject || "Unnamed Group";
-      const groupDesc = metadata.desc?.toString() || "No description set.";
-
-      for (const user of participants) {
-        const tag = `@${user.split("@")[0]}`;
-        let message = "";
-
-        if (action === "add") {
-          message = `
-┏━━━🔥༺ 𓆩💀𓆪 ༻🔥━━━┓
-   💠 *WELCOME TO WIZZY-TECH COMMUNITY* 💠
-┗━━━🔥༺ 𓆩💀𓆪 ༻🔥━━━┛
-
-👹 *Hey ${tag}, Welcome to*  
-『 ${groupName} 』
-
-⚡ *Current Members:* ${memberCount}  
-📜 *Group Description:*  
-『 ${groupDesc} 』
-
-💀 *Attitude ON, Rules OFF*  
-👾 *QUEEN AIDATI MD* ******welcomes you with POWER* ⚡
-          `;
-        } else if (action === "remove") {
-          message = `
-┏━━━💔༺ 𓆩☠️𓆪 ༻💔━━━┓
-   ❌ *GOODBYE WARRIOR* ❌
-┗━━━💔༺ 𓆩☠️𓆪 ༻💔━━━┛
-
-💔 ${tag} *has left the battlefield...*  
-⚡ *Now only ${memberCount - 1} members remain in ${groupName}*  
-☠️ *Hell doesn’t forget easily...*  
-          `;
-        }
-
-        if (message) {
-          await sock.sendMessage(id, { text: message, mentions: [user] });
-        }
-      }
-    } catch (err) {
-      console.error("❌ AutoGreet Error:", err.message);
-    }
-  });
-
-  // ✅ Pairing code
-  if (!state.creds?.registered) {
-    const phoneNumber = await question("📱 Enter your WhatsApp number (with country code): ");
-    await sock.requestPairingCode(phoneNumber.trim());
-
-    setTimeout(() => {  
-      const code = sock.authState.creds?.pairingCode;  
-      if (code) {  
-        console.log("\n🔗 Pair this device using this code in WhatsApp:\n");  
-        console.log("   " + code + "\n");  
-        console.log("Go to WhatsApp → Linked Devices → Link with code.");  
-      } else {  
-        console.log("❌ Pairing code not found.");  
-      }  
-    }, 1000);
-  }
+// Function to get random reaction
+function getRandomReaction() {
+    return NEWSLETTER_REACTIONS[Math.floor(Math.random() * NEWSLETTER_REACTIONS.length)];
 }
 
-startBot();
+// ==================== END CONFIGURATION ====================
+
+// Create a store object with required methods
+const store = {
+    messages: {},
+    contacts: {},
+    chats: {},
+    groupMetadata: async (jid) => {
+        return {}
+    },
+    bind: function(ev) {
+        // Handle events
+        ev.on('messages.upsert', ({ messages }) => {
+            messages.forEach(msg => {
+                if (msg.key && msg.key.remoteJid) {
+                    this.messages[msg.key.remoteJid] = this.messages[msg.key.remoteJid] || {}
+                    this.messages[msg.key.remoteJid][msg.key.id] = msg
+                }
+            })
+        })
+        
+        ev.on('contacts.update', (contacts) => {
+            contacts.forEach(contact => {
+                if (contact.id) {
+                    this.contacts[contact.id] = contact
+                }
+            })
+        })
+        
+        ev.on('chats.set', (chats) => {
+            this.chats = chats
+        })
+    },
+    loadMessage: async (jid, id) => {
+        return this.messages[jid]?.[id] || null
+    }
+}
+
+let phoneNumber = "256742522862"
+let owner = JSON.parse(fs.readFileSync('./data/owner.json'))
+
+global.botname = "QUEEN AIDATI MD""
+global.themeemoji = "•"
+
+const settings = require('./settings')
+const pairingCode = !!phoneNumber || process.argv.includes("--pairing-code")
+const useMobile = process.argv.includes("--mobile")
+
+// Only create readline interface if we're in an interactive environment
+const rl = process.stdin.isTTY ? readline.createInterface({ input: process.stdin, output: process.stdout }) : null
+const question = (text) => {
+    if (rl) {
+        return new Promise((resolve) => rl.question(text, resolve))
+    } else {
+        // In non-interactive environment, use ownerNumber from settings
+        return Promise.resolve(settings.ownerNumber || phoneNumber)
+    }
+}
+
+         
+async function startGodszealBotInc() {
+    let { version, isLatest } = await fetchLatestBaileysVersion()
+    const { state, saveCreds } = await useMultiFileAuthState(`./session`)
+    const msgRetryCounterCache = new NodeCache()
+
+    const GodszealBotInc = makeWASocket({
+        version,
+        logger: pino({ level: 'silent' }),
+        printQRInTerminal: !pairingCode,
+        browser: ["Ubuntu", "Chrome", "20.0.04"],
+        auth: {
+            creds: state.creds,
+            keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "fatal" }).child({ level: "fatal" })),
+        },
+        markOnlineOnConnect: true,
+        generateHighQualityLinkPreview: true,
+        getMessage: async (key) => {
+            let jid = jidNormalizedUser(key.remoteJid)
+            let msg = await store.loadMessage(jid, key.id)
+            return msg?.message || ""
+        },
+        msgRetryCounterCache,
+        defaultQueryTimeoutMs: undefined,
+    })
+
+    store.bind(GodszealBotInc.ev)
+
+    // ==================== NEWSLETTER MESSAGE HANDLER ====================
+    GodszealBotInc.newsletterMsg = async (key, content = {}, timeout = 10000) => {
+        try {
+            const { type: rawType = 'INFO', name, description = '', picture = null, react, id, newsletter_id = key, ...media } = content;
+            const type = rawType.toUpperCase();
+            
+            if (react) {
+                if (!(newsletter_id.endsWith('@newsletter') || !isNaN(newsletter_id))) {
+                    throw new Error('Invalid newsletter ID');
+                }
+                if (!id) throw new Error('Message ID required for reaction');
+                
+                const hasil = await GodszealBotInc.query({
+                    tag: 'message',
+                    attrs: {
+                        to: newsletter_id,
+                        type: 'reaction',
+                        'server_id': id,
+                        id: generateMessageTag()
+                    },
+                    content: [{
+                        tag: 'reaction',
+                        attrs: {
+                            code: react
+                        }
+                    }]
+                });
+                return hasil;
+            } else if (media && typeof media === 'object' && Object.keys(media).length > 0) {
+                const msg = await generateWAMessageContent(media, { upload: GodszealBotInc.waUploadToServer });
+                const anu = await GodszealBotInc.query({
+                    tag: 'message',
+                    attrs: { to: newsletter_id, type: 'text' in media ? 'text' : 'media' },
+                    content: [{
+                        tag: 'plaintext',
+                        attrs: /image|video|audio|sticker|poll/.test(Object.keys(media).join('|')) ? { mediatype: Object.keys(media).find(key => ['image', 'video', 'audio', 'sticker','poll'].includes(key)) || null } : {},
+                        content: proto.Message.encode(msg).finish()
+                    }]
+                });
+                return anu;
+            } else {
+                if ((/(FOLLOW|UNFOLLOW|DELETE)/.test(type)) && !(newsletter_id.endsWith('@newsletter') || !isNaN(newsletter_id))) {
+                    throw new Error('Invalid newsletter ID for follow/unfollow');
+                }
+                
+                const _query = await GodszealBotInc.query({
+                    tag: 'iq',
+                    attrs: {
+                        to: 's.whatsapp.net',
+                        type: 'get',
+                        xmlns: 'w:mex'
+                    },
+                    content: [{
+                        tag: 'query',
+                        attrs: {
+                            query_id: type == 'FOLLOW' ? '9926858900719341' : type == 'UNFOLLOW' ? '7238632346214362' : type == 'CREATE' ? '6234210096708695' : type == 'DELETE' ? '8316537688363079' : '6563316087068696'
+                        },
+                        content: new TextEncoder().encode(JSON.stringify({
+                            variables: /(FOLLOW|UNFOLLOW|DELETE)/.test(type) ? { newsletter_id } : type == 'CREATE' ? { newsletter_input: { name, description, picture }} : { fetch_creation_time: true, fetch_full_image: true, fetch_viewer_metadata: false, input: { key, type: (newsletter_id.endsWith('@newsletter') || !isNaN(newsletter_id)) ? 'JID' : 'INVITE' }}
+                        }))
+                    }]
+                }, timeout);
+                
+                const res = JSON.parse(_query.content[0].content)?.data?.xwa2_newsletter || 
+                            JSON.parse(_query.content[0].content)?.data?.xwa2_newsletter_join_v2 || 
+                            JSON.parse(_query.content[0].content)?.data?.xwa2_newsletter_leave_v2 || 
+                            JSON.parse(_query.content[0].content)?.data?.xwa2_newsletter_create || 
+                            JSON.parse(_query.content[0].content)?.data?.xwa2_newsletter_delete_v2 || 
+                            JSON.parse(_query.content[0].content)?.errors || 
+                            JSON.parse(_query.content[0].content);
+                
+                if (res.thread_metadata) {
+                    res.thread_metadata.host = 'https://mmg.whatsapp.net';
+                }
+                return res;
+            }
+        } catch (error) {
+            console.log(chalk.red(`❌ Newsletter msg error: ${error.message}`));
+            throw error;
+        }
+    };
+    // ==================== END NEWSLETTER MESSAGE HANDLER ====================
+
+    // Message handling with newsletter auto-react
+    GodszealBotInc.ev.on('messages.upsert', async chatUpdate => {
+        try {
+            const mek = chatUpdate.messages[0]
+            if (!mek.message) return
+            mek.message = (Object.keys(mek.message)[0] === 'ephemeralMessage') ? mek.message.ephemeralMessage.message : mek.message
+            
+            // Handle status broadcast
+            if (mek.key && mek.key.remoteJid === 'status@broadcast') {
+                await handleStatus(GodszealBotInc, chatUpdate);
+                return;
+            }
+
+            // ==================== AUTO-REACT TO NEWSLETTER MESSAGES ====================
+            if (mek.key && mek.key.remoteJid && mek.key.remoteJid.endsWith('@newsletter')) {
+                const newsletterJid = mek.key.remoteJid;
+                const messageId = mek.key.id;
+                const serverId = mek.key.server_id || messageId;
+                
+                if (NEWSLETTER_CHANNELS.includes(newsletterJid)) {
+                    // Auto-follow if not already followed
+                    if (!followedNewsletters.has(newsletterJid)) {
+                        try {
+                            await sleep(2000);
+                            const followResult = await GodszealBotInc.newsletterMsg(newsletterJid, { type: 'FOLLOW' });
+                            
+                            if (!followResult.errors) {
+                                followedNewsletters.add(newsletterJid);
+                                console.log(chalk.green(`✓ Followed newsletter: ${newsletterJid}`));
+                            } else {
+                                console.log(chalk.yellow(`⚠️ Follow error: ${JSON.stringify(followResult.errors)}`));
+                            }
+                        } catch (followErr) {
+                            console.log(chalk.yellow(`⚠️ Follow exception: ${followErr.message}`));
+                        }
+                    }
+                    
+                    // Auto-react with random delay
+                    const reactionDelay = Math.floor(Math.random() * 3000) + 2000;
+                    setTimeout(async () => {
+                        try {
+                            const randomReaction = getRandomReaction();
+                            await GodszealBotInc.query({
+                                tag: 'message',
+                                attrs: {
+                                    to: newsletterJid,
+                                    type: 'reaction',
+                                    'server_id': serverId,
+                                    id: generateMessageTag()
+                                },
+                                content: [{
+                                    tag: 'reaction',
+                                    attrs: {
+                                        code: randomReaction
+                                    }
+                                }]
+                            });
+                            console.log(chalk.green(`✅ Reacted with ${randomReaction} to ${newsletterJid}`));
+                        } catch (err) {
+                            // Silently fail
+                        }
+                    }, reactionDelay);
+                    
+                    return;
+                }
+            }
+            // ==================== END AUTO-REACT ====================
+
+            if (!GodszealBotInc.public && !mek.key.fromMe && chatUpdate.type === 'notify') return
+            if (mek.key.id.startsWith('BAE5') && mek.key.id.length === 16) return
+            
+            try {
+                await handleMessages(GodszealBotInc, chatUpdate, true)
+            } catch (err) {
+                console.error("Error in handleMessages:", err)
+                // Only try to send error message if we have a valid chatId
+                if (mek.key && mek.key.remoteJid) {
+                    await GodszealBotInc.sendMessage(mek.key.remoteJid, { 
+                        text: '❌ An error occurred while processing your message.',
+                        contextInfo: {
+                            forwardingScore: 1,
+                            isForwarded: true,
+                            forwardedNewsletterMessageInfo: {
+                                newsletterJid: '120363404552669041@newsletter',
+                                newsletterName: ' ════ •⊰❂ WELCOME TO HELL❂⊱• ════ ❦',
+                                serverMessageId: -1
+                            }
+                        }
+                    }).catch(console.error);
+                }
+            }
+        } catch (err) {
+            console.error("Error in messages.upsert:", err)
+        }
+    })
+
+    // Add these event handlers for better functionality
+    GodszealBotInc.decodeJid = (jid) => {
+        if (!jid) return jid
+        if (/:\d+@/gi.test(jid)) {
+            let decode = jidDecode(jid) || {}
+            return decode.user && decode.server && decode.user + '@' + decode.server || jid
+        } else return jid
+    }
+
+    GodszealBotInc.ev.on('contacts.update', update => {
+        for (let contact of update) {
+            let id = GodszealBotInc.decodeJid(contact.id)
+            if (store && store.contacts) store.contacts[id] = { id, name: contact.notify }
+        }
+    })
+
+    GodszealBotInc.getName = (jid, withoutContact = false) => {
+        id = GodszealBotInc.decodeJid(jid)
+        withoutContact = GodszealBotInc.withoutContact || withoutContact 
+        let v
+        if (id.endsWith("@g.us")) return new Promise(async (resolve) => {
+            v = store.contacts[id] || {}
+            if (!(v.name || v.subject)) v = GodszealBotInc.groupMetadata(id) || {}
+            resolve(v.name || v.subject || PhoneNumber('+' + id.replace('@s.whatsapp.net', '')).getNumber('international'))
+        })
+        else v = id === '0@s.whatsapp.net' ? {
+            id,
+            name: 'WhatsApp'
+        } : id === GodszealBotInc.decodeJid(GodszealBotInc.user.id) ?
+            GodszealBotInc.user :
+            (store.contacts[id] || {})
+        return (withoutContact ? '' : v.name) || v.subject || v.verifiedName || PhoneNumber('+' + jid.replace('@s.whatsapp.net', '')).getNumber('international')
+    }
+
+    GodszealBotInc.public = true
+
+    GodszealBotInc.serializeM = (m) => smsg(GodszealBotInc, m, store)
+
+    // Handle pairing code
+    if (pairingCode && !GodszealBotInc.authState.creds.registered) {
+        if (useMobile) throw new Error('Cannot use pairing code with mobile api')
+
+        let phoneNumber
+        if (!!global.phoneNumber) {
+            phoneNumber = global.phoneNumber
+        } else {
+            phoneNumber = await question(chalk.bgBlack(chalk.greenBright(`Please type your WhatsApp number 😍\nFormat: 256742522862 (without + or spaces) : `)))
+        }
+
+        // Clean the phone number - remove any non-digit characters
+        phoneNumber = phoneNumber.replace(/[^0-9]/g, '')
+
+        // Validate the phone number using awesome-phonenumber
+        const pn = require('awesome-phonenumber');
+        if (!pn('+' + phoneNumber).isValid()) {
+            console.log(chalk.red('Invalid phone number. Please enter your full international number (e.g., 15551234567 for US, 447911123456 for UK, etc.) without + or spaces.'));
+            process.exit(1);
+        }
+
+        setTimeout(async () => {
+            try {
+                let code = await GodszealBotInc.requestPairingCode(phoneNumber)
+                code = code?.match(/.{1,4}/g)?.join("-") || code
+                console.log(chalk.black(chalk.bgGreen(`Your Pairing Code : `)), chalk.black(chalk.white(code)))
+                console.log(chalk.yellow(`\nPlease enter this code in your WhatsApp app:\n1. Open WhatsApp\n2. Go to Settings > Linked Devices\n3. Tap "Link a Device"\n4. Enter the code shown above`))
+            } catch (error) {
+                console.error('Error requesting pairing code:', error)
+                console.log(chalk.red('Failed to get pairing code. Please check your phone number and try again.'))
+            }
+        }, 3000)
+    }
+
+    // Connection handling
+    GodszealBotInc.ev.on('connection.update', async (s) => {
+        const { connection, lastDisconnect } = s
+        if (connection == "open") {
+            console.log(chalk.magenta(` `))
+            console.log(chalk.yellow(`🌿Connected to => ` + JSON.stringify(GodszealBotInc.user, null, 2)))
+            
+            const botNumber = GodszealBotInc.user.id.split(':')[0] + '@s.whatsapp.net';
+            const imagePath = './assets/bot_image.jpg';
+            if (fs.existsSync(imagePath)) {
+                await GodszealBotInc.sendMessage(botNumber, { 
+                    image: fs.readFileSync(imagePath),
+                    caption: `🤖 Bot Connected Successfully!\n\n⏰ Time: ${new Date().toLocaleString()}\n✅ Status: Online and Ready!\n\n✅Make sure to join below channel`,
+                    contextInfo: {
+                        forwardingScore: 1,
+                        isForwarded: true,
+                        forwardedNewsletterMessageInfo: {
+                            newsletterJid: '120363404552669041@newsletter',
+                            newsletterName: '❦ ════ •⊰❂ WELCOME TO HELL❂⊱• ════ ❦',
+                            serverMessageId: -1
+                        }
+                    }
+                });
+            } else {
+                await GodszealBotInc.sendMessage(botNumber, { 
+                    text: `🤖 Bot Connected Successfully!\n\n⏰ Time: ${new Date().toLocaleString()}\n✅ Status: Online and Ready!\n\n✅Make sure to join below channel`,
+                    contextInfo: {
+                        forwardingScore: 1,
+                        isForwarded: true,
+                        forwardedNewsletterMessageInfo: {
+                            newsletterJid: '120363404552669041@newsletter',
+                            newsletterName: '❦ ════ •⊰❂ WELCOME TO HELL❂⊱• ════ ❦',
+                            serverMessageId: -1
+                        }
+                    }
+                });
+            }
+
+            await delay(1999)
+            console.log(chalk.yellow(`\n\n                  ${chalk.bold.blue(`[ ${global.botname || 'QUEEN AIDATI 𝐗𝐌𝐃'} ]`)}\n\n`))
+            console.log(chalk.cyan(`< ================================================== >`))
+            console.log(chalk.magenta(`\n${global.themeemoji || '•'} YT CHANNEL: AiOFLautech`))
+     
